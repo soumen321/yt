@@ -1,0 +1,13 @@
+ input = jsonencode({
+      DocumentName = var.ssm_document_name
+      Parameters = {
+        InstanceIds = ["*"]
+        Commands = [
+          
+        ]
+      }
+      CloudWatchOutputConfig = {
+        CloudWatchLogGroupName = "/aws/ssm/${var.ssm_document_name}"
+        CloudWatchOutputEnabled = true
+      }
+    })
