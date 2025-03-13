@@ -1,0 +1,29 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "VisualEditor0",
+        "Effect": "Allow",
+        "Action": "ssm:SendCommand",
+        "Resource": "arn:aws:ec2:eu-west-1:349816463637:instance/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:ResourceTag/component": "um",
+            "aws:ResourceTag/application": "octopus"
+          }
+        }
+      },
+      {
+        "Sid": "VisualEditor1",
+        "Effect": "Allow",
+        "Action": "ssm:SendCommand",
+        "Resource": "arn:aws:ssm:eu-west-1:349816463637:document/clip-noprod-octopus-cert-notify-execute-script"
+      },
+      {
+        "Sid": "VisualEditor2",
+        "Effect": "Allow",
+        "Action": "ec2:DescribeInstances",
+        "Resource": "*"
+      }
+    ]
+  }
