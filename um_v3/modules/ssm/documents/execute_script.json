@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Clip Automation Monitoring: SSL Certificate Expiry",
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "runShellScript",
+      "inputs": {
+        "runCommand": [
+          "#!/bin/sh",
+          "echo 'SSL Certificate Expiry'",
+          "echo '----------------------'",
+          "echo 'Checking SSL Certificate Expiry for the following domains:'",
+          "echo '-----------------------------------------------------------'"
+        ]
+      }
+    }
+  ]
+}
