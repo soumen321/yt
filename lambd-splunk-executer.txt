@@ -1,0 +1,159 @@
+DynamoDB Table Structure
+
+Table 1: SplunkAlertsConfig (list of alerts to monitor)
+
+alert_name (PK) → Name of the alert in Splunk.
+
+splunk_query (optional) → The saved search or Splunk query string.
+
+last_checked (optional) → ISO timestamp of last check.
+
+Table 2: SplunkAlertTracker (to track already processed KO alerts)
+
+alert_id (PK) → unique identifier (alert_name + timestamp).
+
+processed_at → timestamp.
+
+ticket_number → created ticket reference.
+
+🟢 Updated Lambda Flow
+
+Read alert list from DynamoDB (SplunkAlertsConfig).
+
+For each alert name:
+
+Call Splunk REST API → check if it’s OK/KO.
+
+If KO and not in SplunkAlertTracker → create ticket → insert record.
+
+Run every 15 minutes with EventBridge.
+
+
+
+=============================
+
+import json
+import os
+import boto3
+import requests
+from datetime import datetime
+
+# AWS Clients
+dynamodb = boto3.resource("dynamodb")
+secrets_client = boto3.client("secretsmanager")
+
+CONFIG_TABLE = os.environ["CONFIG_TABLE"]      # SplunkAlertsConfig
+TRACKER_TABLE = os.environ["TRACKER_TABLE"]    # SplunkAlertTracker
+
+# -----------------
+# Secrets Manager
+# -----------------
+def get_secret(secret_name):
+    region = os.environ["AWS_REGION"]
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    return json.loads(response["SecretString"])
+
+# -----------------
+# Splunk API Check
+# -----------------
+def check_alert_status(alert_name):
+    splunk_secret = get_secret(os.environ["SPLUNK_SECRET"])
+    splunk_url = splunk_secret["url"]
+    token = splunk_secret["token"]
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    # Example endpoint: Get saved search results for alert_name
+    url = f"{splunk_url}/servicesNS/admin/search/saved/searches/{alert_name}?output_mode=json"
+    response = requests.get(url, headers=headers, verify=False)
+
+    if response.status_code != 200:
+        print(f"Error fetching {alert_name}: {response.text}")
+        return "UNKNOWN"
+
+    data = response.json()
+    # Simplified: Assume KO if alert is disabled=false and triggered
+    if "KO" in data.get("entry", [{}])[0].get("name", "").upper():
+        return "KO"
+    return "OK"
+
+# -----------------
+# Ticket Creation (ServiceNow Example)
+# -----------------
+def create_ticket(alert_name):
+    servicenow_secret = get_secret(os.environ["SERVICENOW_SECRET"])
+    snow_url = servicenow_secret["url"]
+    user = servicenow_secret["user"]
+    password = servicenow_secret["password"]
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "short_description": f"Splunk Alert KO - {alert_name}",
+        "description": f"Alert {alert_name} is in KO state at {datetime.utcnow()}",
+        "category": "Splunk Monitoring",
+        "priority": "2"
+    }
+
+    response = requests.post(
+        f"{snow_url}/api/now/table/incident",
+        auth=(user, password),
+        headers=headers,
+        data=json.dumps(payload)
+    )
+
+    if response.status_code not in [200, 201]:
+        raise Exception(f"ServiceNow Error: {response.status_code} {response.text}")
+
+    return response.json()["result"]["number"]
+
+# -----------------
+# Duplicate Check
+# -----------------
+def is_new_alert(alert_name):
+    table = dynamodb.Table(TRACKER_TABLE)
+    response = table.get_item(Key={"alert_id": alert_name})
+    return "Item" not in response
+
+def mark_alert_processed(alert_name, ticket_number):
+    table = dynamodb.Table(TRACKER_TABLE)
+    table.put_item(Item={
+        "alert_id": alert_name,
+        "ticket_number": ticket_number,
+        "processed_at": str(datetime.utcnow())
+    })
+
+# -----------------
+# Lambda Handler
+# -----------------
+def lambda_handler(event, context):
+    config_table = dynamodb.Table(CONFIG_TABLE)
+    alerts = config_table.scan().get("Items", [])
+
+    for item in alerts:
+        alert_name = item["alert_name"]
+        status = check_alert_status(alert_name)
+
+        if status == "KO":
+            if is_new_alert(alert_name):
+                ticket_number = create_ticket(alert_name)
+                mark_alert_processed(alert_name, ticket_number)
+                print(f"✅ Ticket {ticket_number} created for {alert_name}")
+            else:
+                print(f"⚠️ {alert_name} already processed")
+        else:
+            print(f"ℹ️ {alert_name} is OK")
+
+    return {"checked_alerts": len(alerts)}
+
+
+
+
+
+
+
+
+
+
