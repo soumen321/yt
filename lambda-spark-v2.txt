@@ -1,0 +1,446 @@
+
+reads ~70 alert names from DynamoDB config table
+
+prioritizes UNKNOWN alerts for retry
+
+runs Splunk saved-search -> extracts query -> runs the query (starts job, polls with timeout)
+
+parallelizes with ThreadPoolExecutor (configurable MAX_WORKERS)
+
+per-query timeout & polling (max_wait and poll_interval)
+
+atomic retry counter in DynamoDB and automatic escalation to ServiceNow after 3 UNKNOWN attempts
+
+caches Secrets Manager secrets and Splunk/HTTP sessions between warm invocations
+
+CloudWatch custom metrics (counts of OK / KO / UNKNOWN / ESCALATED / tickets created)
+
+safety: checks remaining Lambda time and avoids starting new work if < 2 minutes left (marks the rest UNKNOWN)
+
+structured logging
+
+1. Don’t Wait Forever – Use Polling with Timeout
+
+When you submit a Splunk search (/services/search/jobs), you get a search ID (SID).
+
+Instead of immediately waiting for results, poll with /services/search/jobs/{sid} until it finishes.
+
+Add a max wait time per query (e.g., 60–90 seconds).
+
+If still not ready → mark as "UNKNOWN" and log.
+
+
+=========================config=======================
+
+CONFIG_TABLE = SplunkAlertsConfig
+TRACKER_TABLE = SplunkAlertTracker
+SPLUNK_SECRET = splunk-secret-name
+SERVICENOW_SECRET = servicenow-secret-name
+AWS_REGION = your-region (e.g. us-east-1)
+MAX_WORKERS = 10            # optional, default 10
+QUERY_MAX_WAIT = 90         # optional seconds per query
+QUERY_POLL_INTERVAL = 5     # optional seconds between polls
+ESCALATION_RETRY_LIMIT = 3  # optional
+LAMBDA_SAFETY_BUFFER_MS = 120000  # 2 minutes before timeout to stop starting new work
+
+
+==========================================================================
+
+import os
+import json
+import time
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import boto3
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from botocore.exceptions import ClientError
+
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# -------------------------
+# AWS clients & globals (cached across warm starts)
+# -------------------------
+dynamodb = boto3.resource("dynamodb")
+secrets_client = boto3.client("secretsmanager")
+cloudwatch = boto3.client("cloudwatch")
+
+# Cached objects - will be populated on cold start and reused for warm invocations
+_CACHE = {
+    "splunk_secret": None,
+    "servicenow_secret": None,
+    "splunk_session": None,
+    "http_session": None
+}
+
+# -------------------------
+# Config from env
+# -------------------------
+CONFIG_TABLE = os.environ["CONFIG_TABLE"]
+TRACKER_TABLE = os.environ["TRACKER_TABLE"]
+SPLUNK_SECRET_NAME = os.environ["SPLUNK_SECRET"]
+SERVICENOW_SECRET_NAME = os.environ["SERVICENOW_SECRET"]
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "10"))
+QUERY_MAX_WAIT = int(os.environ.get("QUERY_MAX_WAIT", "90"))
+QUERY_POLL_INTERVAL = int(os.environ.get("QUERY_POLL_INTERVAL", "5"))
+ESCALATION_RETRY_LIMIT = int(os.environ.get("ESCALATION_RETRY_LIMIT", "3"))
+LAMBDA_SAFETY_BUFFER_MS = int(os.environ.get("LAMBDA_SAFETY_BUFFER_MS", "120000"))  # don't start new queries if < buffer left
+
+# -------------------------
+# Utility: get secret (cached)
+# -------------------------
+def get_secret_cached(secret_name, cache_key):
+    if _CACHE.get(cache_key) is None:
+        try:
+            resp = secrets_client.get_secret_value(SecretId=secret_name)
+            secret = json.loads(resp["SecretString"])
+            _CACHE[cache_key] = secret
+            logger.info(f"Loaded secret {secret_name} into cache")
+        except ClientError as e:
+            logger.exception(f"Failed to load secret {secret_name}: {e}")
+            raise
+    return _CACHE[cache_key]
+
+# -------------------------
+# HTTP session with retries (cached)
+# -------------------------
+def get_requests_session():
+    if _CACHE.get("http_session") is None:
+        session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "DELETE"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _CACHE["http_session"] = session
+    return _CACHE["http_session"]
+
+def get_splunk_session():
+    # we use the same pattern but separate function for clarity
+    if _CACHE.get("splunk_session") is None:
+        _CACHE["splunk_session"] = get_requests_session()
+    return _CACHE["splunk_session"]
+
+# -------------------------
+# Splunk helpers
+# -------------------------
+def get_alert_details(alert_name, splunk_url, token, timeout=15):
+    """
+    Fetch saved search details for alert_name, return (description, query).
+    """
+    session = get_splunk_session()
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{splunk_url}/servicesNS/admin/search/saved/searches/{alert_name}?output_mode=json"
+    r = session.get(url, headers=headers, timeout=timeout, verify=False)
+    r.raise_for_status()
+    data = r.json()
+    entry = data.get("entry", [{}])[0]
+    content = entry.get("content", {}) or {}
+    description = content.get("description", "")
+    query = content.get("search", "")
+    return description, query
+
+def run_splunk_query_and_wait(query, splunk_url, token, max_wait=QUERY_MAX_WAIT, poll_interval=QUERY_POLL_INTERVAL):
+    """
+    Start a Splunk search job and poll until done or timeout.
+    Returns: "OK" | "KO" | "UNKNOWN"
+    Logic: if results non-empty -> KO, else OK.
+    """
+    session = get_splunk_session()
+    headers = {"Authorization": f"Bearer {token}"}
+    search_url = f"{splunk_url}/services/search/jobs?output_mode=json"
+
+    # start job
+    resp = session.post(search_url, headers=headers, data={"search": query}, timeout=15, verify=False)
+    resp.raise_for_status()
+    sid = resp.json().get("sid")
+    if not sid:
+        logger.warning("Splunk job started but no SID returned")
+        return "UNKNOWN"
+
+    start = time.time()
+    try:
+        while time.time() - start < max_wait:
+            status_url = f"{splunk_url}/services/search/jobs/{sid}?output_mode=json"
+            r = session.get(status_url, headers=headers, timeout=10, verify=False)
+            r.raise_for_status()
+            content = r.json()["entry"][0]["content"]
+            if content.get("isDone"):
+                # get results
+                results_url = f"{splunk_url}/services/search/jobs/{sid}/results?output_mode=json"
+                r2 = session.get(results_url, headers=headers, timeout=30, verify=False)
+                r2.raise_for_status()
+                results = r2.json().get("results", [])
+                return "KO" if results else "OK"
+            time.sleep(poll_interval)
+    except requests.RequestException as e:
+        logger.exception(f"Network error polling Splunk SID {sid}: {e}")
+        return "UNKNOWN"
+    except Exception as e:
+        logger.exception(f"Unexpected error polling Splunk SID {sid}: {e}")
+        return "UNKNOWN"
+
+    # timed out
+    logger.info(f"Splunk query SID {sid} timed out after {max_wait}s")
+    return "UNKNOWN"
+
+# -------------------------
+# ServiceNow / ticket helper
+# -------------------------
+def create_servicenow_ticket(alert_name, note=None):
+    secret = get_secret_cached(SERVICENOW_SECRET_NAME, "servicenow_secret")
+    snow_url = secret["url"].rstrip("/")
+    user = secret["user"]
+    pwd = secret["password"]
+    session = get_requests_session()
+    payload = {
+        "short_description": f"Splunk Alert - {alert_name}",
+        "description": f"{note or f'Alert {alert_name} triggered, created at {datetime.utcnow().isoformat()}'}",
+        "category": "Splunk Monitoring",
+        "priority": "2"
+    }
+    url = f"{snow_url}/api/now/table/incident"
+    r = session.post(url, auth=(user, pwd), headers={"Content-Type": "application/json"},
+                     data=json.dumps(payload), timeout=15)
+    r.raise_for_status()
+    res = r.json()
+    # path: result.number or result.sys_id; use number if present
+    ticket_num = res.get("result", {}).get("number") or res.get("result", {}).get("sys_id")
+    logger.info(f"Created ServiceNow ticket {ticket_num} for {alert_name}")
+    return ticket_num
+
+# -------------------------
+# DynamoDB tracker helpers (atomic operations)
+# -------------------------
+def get_unknown_alerts():
+    """Return list of alert_ids currently marked UNKNOWN"""
+    table = dynamodb.Table(TRACKER_TABLE)
+    # scan with filter on 'status' eq 'UNKNOWN'
+    resp = table.scan(FilterExpression="#s = :s", ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={":s": "UNKNOWN"})
+    return [item["alert_id"] for item in resp.get("Items", [])]
+
+def update_alert_status(alert_name, status, ticket_number=None):
+    """
+    Atomic update of tracker table.
+    - If status == UNKNOWN: increment retry_count atomically and return new retry_count.
+    - If retry_count >= ESCALATION_RETRY_LIMIT after increment -> escalate to ServiceNow and set status 'ESCALATED' and reset retry_count.
+    - For OK/KO/ESCALATED: set retry_count = 0
+    Returns dict with updated fields.
+    """
+    table = dynamodb.Table(TRACKER_TABLE)
+    now_ts = int(time.time())
+
+    if status == "UNKNOWN":
+        # increment retry_count atomically and set status, updated_at
+        try:
+            resp = table.update_item(
+                Key={"alert_id": alert_name},
+                UpdateExpression="SET #s = :s, updated_at = :u ADD retry_count :inc",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": status, ":u": now_ts, ":inc": 1},
+                ReturnValues="UPDATED_NEW"
+            )
+            new_retry = int(resp["Attributes"].get("retry_count", 0))
+            logger.info(f"Alert {alert_name} marked UNKNOWN, retry_count={new_retry}")
+            # escalate if needed
+            if new_retry >= ESCALATION_RETRY_LIMIT:
+                note = f"Alert {alert_name} failed to complete Splunk query {ESCALATION_RETRY_LIMIT} times. Escalating."
+                ticket_num = create_servicenow_ticket(alert_name, note=note)
+                # set ESCALATED and reset retry_count to 0
+                resp2 = table.update_item(
+                    Key={"alert_id": alert_name},
+                    UpdateExpression="SET #s = :es, ticket_number = :t, updated_at = :u REMOVE retry_count",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":es": "ESCALATED", ":t": str(ticket_num), ":u": now_ts},
+                    ReturnValues="ALL_NEW"
+                )
+                logger.info(f"Alert {alert_name} escalated, ticket {ticket_num}")
+                return {"status": "ESCALATED", "retry_count": 0, "ticket_number": str(ticket_num)}
+            return {"status": "UNKNOWN", "retry_count": new_retry}
+        except ClientError as e:
+            logger.exception(f"DynamoDB update failed for UNKNOWN {alert_name}: {e}")
+            return {"status": "UNKNOWN", "retry_count": None}
+    else:
+        # For OK or KO or ESCALATED explicitly: reset retry_count
+        item = {
+            "alert_id": alert_name,
+            "status": status,
+            "updated_at": now_ts
+        }
+        if ticket_number:
+            item["ticket_number"] = str(ticket_number)
+        try:
+            table.put_item(Item=item)
+            logger.info(f"Updated alert {alert_name} status={status}")
+            return {"status": status, "retry_count": 0, "ticket_number": ticket_number}
+        except ClientError as e:
+            logger.exception(f"DynamoDB put_item failed for {alert_name}: {e}")
+            return {"status": status, "retry_count": None}
+
+# -------------------------
+# Worker: process single alert
+# -------------------------
+def process_alert(alert_name, splunk_url, token):
+    """
+    Full flow for one alert:
+    - get saved-search details (description + query)
+    - run query and poll
+    - if KO -> create ticket and set status KO
+    - if OK -> set status OK
+    - if UNKNOWN -> increment retry_count and maybe escalate (handled in update_alert_status)
+    """
+    logger.info(f"Starting processing alert {alert_name}")
+    try:
+        description, query = get_alert_details(alert_name, splunk_url, token)
+        if not query:
+            # no query in saved search — treat as UNKNOWN/escalate conceptually
+            logger.warning(f"No query found for alert {alert_name}; marking UNKNOWN")
+            update_alert_status(alert_name, "UNKNOWN")
+            return {"alert": alert_name, "status": "UNKNOWN", "note": "no query"}
+        status = run_splunk_query_and_wait(query, splunk_url, token)
+        if status == "KO":
+            ticket = create_servicenow_ticket(alert_name, note=f"Splunk KO for {alert_name}; desc: {description}")
+            update_alert_status(alert_name, "KO", ticket_number=ticket)
+            return {"alert": alert_name, "status": "KO", "ticket": ticket}
+        elif status == "OK":
+            update_alert_status(alert_name, "OK")
+            return {"alert": alert_name, "status": "OK"}
+        else:
+            # UNKNOWN
+            result = update_alert_status(alert_name, "UNKNOWN")
+            return {"alert": alert_name, "status": "UNKNOWN", "retry_count": result.get("retry_count")}
+    except requests.RequestException as e:
+        logger.exception(f"Network error when processing {alert_name}: {e}")
+        update_alert_status(alert_name, "UNKNOWN")
+        return {"alert": alert_name, "status": "UNKNOWN", "error": str(e)}
+    except Exception as e:
+        logger.exception(f"Unexpected error processing {alert_name}: {e}")
+        update_alert_status(alert_name, "UNKNOWN")
+        return {"alert": alert_name, "status": "UNKNOWN", "error": str(e)}
+
+# -------------------------
+# CloudWatch metric helper
+# -------------------------
+def publish_metrics(namespace, metrics):
+    """
+    metrics: list of dicts like {"MetricName": "...", "Value": 1, "Unit": "Count"}
+    """
+    try:
+        cloudwatch.put_metric_data(Namespace=namespace, MetricData=metrics)
+    except Exception as e:
+        logger.exception(f"Failed to publish metrics: {e}")
+
+# -------------------------
+# Lambda handler
+# -------------------------
+def lambda_handler(event, context):
+    start_ts = time.time()
+
+    # Load secrets (cached)
+    splunk_secret = get_secret_cached(SPLUNK_SECRET_NAME, "splunk_secret")
+    splunk_url = splunk_secret["url"].rstrip("/")
+    splunk_token = splunk_secret.get("token") or splunk_secret.get("auth_token") or splunk_secret.get("password")
+
+    # load servicenow too (cached)
+    get_secret_cached(SERVICENOW_SECRET_NAME, "servicenow_secret")
+
+    # fetch alerts from config
+    config_table = dynamodb.Table(CONFIG_TABLE)
+    try:
+        config_resp = config_table.scan()
+        config_items = config_resp.get("Items", [])
+        alerts_from_config = [it["alert_name"] for it in config_items if "alert_name" in it]
+    except Exception as e:
+        logger.exception(f"Failed to read config table {CONFIG_TABLE}: {e}")
+        alerts_from_config = []
+
+    # get retry alerts (UNKNOWN) and prioritize them
+    try:
+        retry_alerts = get_unknown_alerts()
+    except Exception as e:
+        logger.exception(f"Failed to fetch UNKNOWN alerts: {e}")
+        retry_alerts = []
+
+    # merged list, with retry alerts first and deduplicated preserving order
+    merged = []
+    seen = set()
+    for a in retry_alerts + alerts_from_config:
+        if a not in seen:
+            merged.append(a)
+            seen.add(a)
+
+    total_alerts = len(merged)
+    logger.info(f"Alerts to process: {total_alerts} (retry_first={len(retry_alerts)})")
+
+    results = []
+    # safety: before creating new tasks, ensure sufficient remaining time
+    remaining_ms = context.get_remaining_time_in_millis()
+    if remaining_ms < LAMBDA_SAFETY_BUFFER_MS:
+        logger.warning(f"Not enough remaining time ({remaining_ms}ms). Marking all as UNKNOWN and exiting.")
+        for a in merged:
+            update_alert_status(a, "UNKNOWN")
+        return {"status": "skipped_all_due_to_time", "alerts": total_alerts}
+
+    # use ThreadPoolExecutor to process in parallel
+    metrics_counts = {"OK": 0, "KO": 0, "UNKNOWN": 0, "ESCALATED": 0, "TICKETS_CREATED": 0}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_alert = {}
+        for alert in merged:
+            # before submitting, check remaining time
+            remaining_ms = context.get_remaining_time_in_millis()
+            if remaining_ms < LAMBDA_SAFETY_BUFFER_MS:
+                logger.warning(f"Remaining time {remaining_ms}ms < safety buffer; marking remaining alerts UNKNOWN")
+                update_alert_status(alert, "UNKNOWN")
+                results.append({"alert": alert, "status": "UNKNOWN", "note": "skipped_due_to_time"})
+                continue
+            future = executor.submit(process_alert, alert, splunk_url, splunk_token)
+            future_to_alert[future] = alert
+
+        # gather results as they finish
+        for fut in as_completed(future_to_alert):
+            try:
+                r = fut.result()
+            except Exception as e:
+                logger.exception(f"Worker thread raised unhandled exception: {e}")
+                r = {"alert": future_to_alert.get(fut), "status": "UNKNOWN", "error": str(e)}
+            results.append(r)
+            st = r.get("status")
+            if st == "OK":
+                metrics_counts["OK"] += 1
+            elif st == "KO":
+                metrics_counts["KO"] += 1
+                metrics_counts["TICKETS_CREATED"] += 1
+            elif st == "ESCALATED":
+                metrics_counts["ESCALATED"] += 1
+                metrics_counts["TICKETS_CREATED"] += 1
+            else:
+                metrics_counts["UNKNOWN"] += 1
+
+    # publish CloudWatch metrics
+    metric_data = []
+    for k, v in metrics_counts.items():
+        metric_data.append({"MetricName": k, "Value": v, "Unit": "Count"})
+    publish_metrics("SplunkAlertMonitor", metric_data)
+
+    elapsed = time.time() - start_ts
+    logger.info(f"Run complete: checked={len(results)} elapsed={elapsed:.2f}s metrics={metrics_counts}")
+
+    return {
+        "checked_alerts": len(results),
+        "elapsed_seconds": elapsed,
+        "metrics": metrics_counts,
+        "results_sample": results[:10]  # avoid huge payload
+    }
