@@ -1,0 +1,166 @@
+import boto3
+import requests
+import time
+import os
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ------------------ CONFIG ------------------
+SPLUNK_URL = os.environ.get("SPLUNK_URL")
+SPLUNK_AUTH = (os.environ.get("SPLUNK_USER"), os.environ.get("SPLUNK_PASS"))
+SERVICENOW_URL = os.environ.get("SERVICENOW_URL")
+SERVICENOW_AUTH = (os.environ.get("SERVICENOW_USER"), os.environ.get("SERVICENOW_PASS"))
+
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "SplunkAlerts")
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "10"))
+SPLUNK_TIMEOUT = 90  # seconds to wait for each query
+RETRY_LIMIT = 3
+
+# ------------------ LOGGING ------------------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ------------------ HELPERS ------------------
+def create_retry_session():
+    """HTTP session with retry + backoff for Splunk calls"""
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+session = create_retry_session()
+
+def get_alerts_from_dynamodb():
+    """Fetch all alert names from DynamoDB"""
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(DYNAMODB_TABLE)
+    response = table.scan()
+    alerts = [item["alert_name"] for item in response.get("Items", [])]
+    return alerts
+
+def run_splunk_query(query):
+    """Dispatch Splunk search, poll job, and fetch results safely"""
+    try:
+        # 1. Submit search
+        search_url = f"{SPLUNK_URL}/services/search/jobs"
+        data = {"search": query, "exec_mode": "normal"}
+        r = session.post(search_url, auth=SPLUNK_AUTH, data=data, verify=False, timeout=30)
+        r.raise_for_status()
+        sid = r.json()["sid"]
+
+        # 2. Poll job status
+        status_url = f"{SPLUNK_URL}/services/search/jobs/{sid}"
+        start = time.time()
+        while time.time() - start < SPLUNK_TIMEOUT:
+            status = session.get(status_url, auth=SPLUNK_AUTH, verify=False).json()
+            if status["entry"][0]["content"]["isDone"]:
+                break
+            time.sleep(2)
+
+        # 3. Try fetching results in multiple ways
+        results = fetch_results_with_fallback(sid)
+        return results
+
+    except Exception as e:
+        logger.error(f"Splunk query failed: {e}")
+        return []
+
+def fetch_results_with_fallback(sid):
+    """Try results → results_preview → export to get Splunk data"""
+    params = {"output_mode": "json", "count": 0}
+
+    endpoints = [
+        f"{SPLUNK_URL}/services/search/jobs/{sid}/results",
+        f"{SPLUNK_URL}/services/search/jobs/{sid}/results_preview",
+        f"{SPLUNK_URL}/services/search/jobs/{sid}/results_export",
+    ]
+
+    for url in endpoints:
+        try:
+            r = session.get(url, auth=SPLUNK_AUTH, params=params, verify=False, timeout=60)
+            r.raise_for_status()
+            data = r.json().get("results", [])
+            if data:
+                logger.info(f"Fetched {len(data)} results from {url}")
+                return data
+        except Exception as e:
+            logger.warning(f"Fetch from {url} failed: {e}")
+
+    return []
+
+def process_alert(alert_name):
+    """Get alert query from Splunk → run search → create ticket if KO"""
+    try:
+        # Step 1: Fetch alert details (get query from alert description)
+        alert_url = f"{SPLUNK_URL}/services/saved/searches/{alert_name}"
+        r = session.get(alert_url, auth=SPLUNK_AUTH, params={"output_mode": "json"}, verify=False, timeout=30)
+        r.raise_for_status()
+        alert_content = r.json()["entry"][0]["content"]
+        query = alert_content.get("search", "")
+
+        if not query:
+            logger.warning(f"No query found for alert {alert_name}")
+            return
+
+        # Step 2: Run query
+        results = run_splunk_query(query)
+
+        # Step 3: Check results for KO
+        status = "OK"
+        for row in results:
+            if "status" in row and row["status"] == "KO":
+                status = "KO"
+                break
+
+        # Step 4: Create ticket if KO
+        if status == "KO":
+            create_servicenow_ticket(alert_name, query)
+            logger.info(f"Ticket created for alert {alert_name}")
+        else:
+            logger.info(f"Alert {alert_name} status OK")
+
+    except Exception as e:
+        logger.error(f"Error processing alert {alert_name}: {e}")
+
+def create_servicenow_ticket(alert_name, query):
+    """Create ServiceNow ticket for KO alerts"""
+    try:
+        payload = {
+            "short_description": f"Splunk Alert Triggered: {alert_name}",
+            "description": f"Alert {alert_name} failed. Query: {query}",
+            "category": "Splunk",
+            "priority": "2"
+        }
+        r = session.post(
+            f"{SERVICENOW_URL}/api/now/table/incident",
+            auth=SERVICENOW_AUTH,
+            json=payload,
+            timeout=30,
+            verify=False
+        )
+        r.raise_for_status()
+    except Exception as e:
+        logger.error(f"Failed to create ServiceNow ticket for {alert_name}: {e}")
+
+# ------------------ LAMBDA HANDLER ------------------
+def lambda_handler(event, context):
+    alerts = get_alerts_from_dynamodb()
+    logger.info(f"Found {len(alerts)} alerts in DynamoDB")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_alert, alert): alert for alert in alerts}
+        for future in as_completed(futures):
+            alert = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Alert {alert} execution failed: {e}")
+
+    return {"status": "done", "alerts_processed": len(alerts)}
