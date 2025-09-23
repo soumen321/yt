@@ -1,3 +1,26 @@
+🔑 New Behavior
+
+DynamoDB table stores:
+
+alert_name
+
+last_status (OK/KO)
+
+last_ticket_id (if KO)
+
+last_updated (timestamp)
+
+When Lambda runs:
+
+If alert goes KO → KO again and last ticket still exists → ❌ don’t create a duplicate.
+
+If alert goes OK → KO → ✅ create a new ticket and update checkpoint.
+
+If alert goes KO → OK → update checkpoint to OK.
+
+
+
+
 import boto3
 import requests
 import time
