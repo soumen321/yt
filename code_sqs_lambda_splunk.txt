@@ -1,0 +1,261 @@
+### Scheduler Lambda (Push Alerts to SQS)
+=================================================
+  
+import boto3
+import os
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+dynamodb = boto3.resource("dynamodb")
+sqs = boto3.client("sqs")
+
+ALERTS_TABLE = os.environ.get("ALERTS_TABLE", "SplunkAlerts")
+QUEUE_URL = os.environ["SQS_QUEUE_URL"]
+
+def lambda_handler(event, context):
+    table = dynamodb.Table(ALERTS_TABLE)
+    response = table.scan()
+    alerts = [item["alert_name"] for item in response.get("Items", [])]
+
+    for alert_name in alerts:
+        sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=alert_name)
+        logger.info(f"Queued alert: {alert_name}")
+
+    return {"status": "done", "alerts_sent": len(alerts)}
+
+========================================================
+### Worker Lambda (Process Each Alert from SQS)
+========================================================
+
+import boto3
+import requests
+import time
+import os
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# -------- CONFIG --------
+SPLUNK_URL = os.environ["SPLUNK_URL"]
+SPLUNK_AUTH = (os.environ["SPLUNK_USER"], os.environ["SPLUNK_PASS"])
+SERVICENOW_URL = os.environ["SERVICENOW_URL"]
+SERVICENOW_AUTH = (os.environ["SERVICENOW_USER"], os.environ["SERVICENOW_PASS"])
+CHECKPOINT_TABLE = os.environ.get("CHECKPOINT_TABLE", "SplunkAlertCheckpoints")
+SPLUNK_TIMEOUT = 90  # seconds
+
+# -------- AWS RESOURCES --------
+dynamodb = boto3.resource("dynamodb")
+checkpoint_table = dynamodb.Table(CHECKPOINT_TABLE)
+
+# -------- HTTP SESSION --------
+def create_retry_session():
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+
+session = create_retry_session()
+
+# -------- HELPERS --------
+def get_checkpoint(alert_name):
+    resp = checkpoint_table.get_item(Key={"alert_name": alert_name})
+    return resp.get("Item")
+
+def update_checkpoint(alert_name, status, ticket_id=None):
+    checkpoint_table.put_item(
+        Item={
+            "alert_name": alert_name,
+            "last_status": status,
+            "last_ticket_id": ticket_id or "N/A",
+            "last_updated": datetime.utcnow().isoformat()
+        }
+    )
+
+# -------- SPLUNK QUERIES --------
+def run_splunk_query(query):
+    results = run_via_export(query)
+    if results:
+        return results
+    return run_via_jobs(query)
+
+def run_via_export(query):
+    try:
+        url = f"{SPLUNK_URL}/services/search/jobs/export"
+        params = {"search": query, "output_mode": "json", "exec_mode": "blocking"}
+        r = session.post(url, auth=SPLUNK_AUTH, data=params, verify=False, timeout=300, stream=True)
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except Exception as e:
+        logger.warning(f"Export API failed: {e}")
+    return []
+
+def run_via_jobs(query):
+    try:
+        # 1. Create job
+        search_url = f"{SPLUNK_URL}/services/search/jobs"
+        r = session.post(search_url, auth=SPLUNK_AUTH, data={"search": query, "exec_mode": "normal"}, verify=False, timeout=30)
+        r.raise_for_status()
+        sid = r.json()["sid"]
+
+        # 2. Poll job
+        status_url = f"{SPLUNK_URL}/services/search/jobs/{sid}"
+        start = time.time()
+        while time.time() - start < SPLUNK_TIMEOUT:
+            r = session.get(status_url, auth=SPLUNK_AUTH, params={"output_mode": "json"}, verify=False, timeout=30)
+            r.raise_for_status()
+            content = r.json()["entry"][0]["content"]
+            if content.get("isDone"):
+                break
+            time.sleep(2)
+
+        # 3. Get results
+        results_url = f"{SPLUNK_URL}/services/search/jobs/{sid}/results"
+        r = session.get(results_url, auth=SPLUNK_AUTH, params={"output_mode": "json_rows", "count": 0}, verify=False, timeout=120)
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except Exception as e:
+        logger.error(f"Jobs API failed: {e}")
+    return []
+
+# -------- SERVICENOW --------
+def create_servicenow_ticket(alert_name, query):
+    try:
+        payload = {
+            "short_description": f"Splunk Alert Triggered: {alert_name}",
+            "description": f"Alert {alert_name} failed. Query: {query}",
+            "category": "Splunk",
+            "priority": "2"
+        }
+        r = session.post(
+            f"{SERVICENOW_URL}/api/now/table/incident",
+            auth=SERVICENOW_AUTH,
+            json=payload,
+            timeout=30,
+            verify=False
+        )
+        r.raise_for_status()
+        return r.json().get("result", {}).get("sys_id", "UNKNOWN")
+    except Exception as e:
+        logger.error(f"ServiceNow ticket creation failed: {e}")
+        return None
+
+# -------- MAIN PROCESS --------
+def process_alert(alert_name):
+    try:
+        # Get query from Splunk saved search
+        alert_url = f"{SPLUNK_URL}/services/saved/searches/{alert_name}"
+        r = session.get(alert_url, auth=SPLUNK_AUTH, params={"output_mode": "json"}, verify=False, timeout=30)
+        r.raise_for_status()
+        query = r.json()["entry"][0]["content"].get("search", "")
+        if not query:
+            return
+
+        # Run query
+        results = run_splunk_query(query)
+        status = "OK"
+        for row in results:
+            if "status" in row and row["status"] == "KO":
+                status = "KO"
+                break
+
+        # Check checkpoint
+        checkpoint = get_checkpoint(alert_name)
+        last_status = checkpoint["last_status"] if checkpoint else "OK"
+
+        if status == "KO":
+            if last_status == "KO":
+                logger.info(f"{alert_name} still KO, no new ticket")
+            else:
+                ticket_id = create_servicenow_ticket(alert_name, query)
+                if ticket_id:
+                    update_checkpoint(alert_name, "KO", ticket_id)
+                    logger.info(f"Created ServiceNow ticket {ticket_id} for {alert_name}")
+        else:
+            if last_status == "KO":
+                logger.info(f"{alert_name} recovered (KO → OK)")
+            update_checkpoint(alert_name, "OK")
+
+    except Exception as e:
+        logger.error(f"Error processing {alert_name}: {e}")
+
+# -------- LAMBDA HANDLER --------
+def lambda_handler(event, context):
+    for record in event["Records"]:
+        alert_name = record["body"]
+        process_alert(alert_name)
+
+
+==============================================
+### Lambda 3: Ticket Lambda
+==================================
+
+import boto3
+import os
+import json
+import requests
+from datetime import datetime
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(os.getenv("CHECKPOINTS_TABLE"))
+
+SERVICENOW_URL = os.getenv("SERVICENOW_URL")
+SERVICENOW_USER = os.getenv("SERVICENOW_USER")
+SERVICENOW_PASS = os.getenv("SERVICENOW_PASS")
+
+def create_servicenow_ticket(alert_name, description):
+    payload = {
+        "short_description": f"Alert Triggered: {alert_name}",
+        "description": description,
+        "category": "inquiry",
+        "subcategory": "alert"
+    }
+    resp = requests.post(
+        f"{SERVICENOW_URL}/api/now/table/incident",
+        auth=(SERVICENOW_USER, SERVICENOW_PASS),
+        headers={"Content-Type": "application/json"},
+        json=payload
+    )
+    resp.raise_for_status()
+    return resp.json()["result"]["sys_id"]
+
+def lambda_handler(event, context):
+    for record in event["Records"]:
+        body = json.loads(record["body"])
+        alert_id = body["alert_id"]
+        alert_name = body["alert_name"]
+        status = body["status"]
+
+        # Check last status from DynamoDB
+        item = table.get_item(Key={"alert_id": alert_id}).get("Item")
+
+        last_status = item["last_status"] if item else "OK"
+        if last_status == "OK" and status == "KO":
+            ticket_id = create_servicenow_ticket(alert_name, body["description"])
+
+            table.put_item(Item={
+                "alert_id": alert_id,
+                "last_status": status,
+                "last_ticket": ticket_id,
+                "updated_at": datetime.utcnow().isoformat()
+            })
+        else:
+            # just update status
+            table.put_item(Item={
+                "alert_id": alert_id,
+                "last_status": status,
+                "updated_at": datetime.utcnow().isoformat()
+            })
+
+
+    return {"status": "processed", "records": len(event["Records"])}
